@@ -68,3 +68,11 @@ with tf.Session() as sess:
     print ("Multiplication with variables: %i" % sess.run(mul, feed_dict={a: 2, b: 3}))
 ```
 
+## Basic_Models
+
+### logistics_regression
+
+$$
+Categorical\ Cross\ Entropy\ Loss =-\sum_{i=1}^C y_i \cdot \log \left(p_i\right)
+$$
+
