@@ -439,3 +439,195 @@ MyModuleWithParams = relax.transform.BindParams("main", nd_params)(MyModuleMixtu
 script_with_meta = MyModuleWithParams.script(show_meta=True)
 print(script_with_meta)
 ```
+
+### 8 作业：从Pytorch迁移模型
+
+需要的头文件
+
+```python
+import numpy as np
+import pickle as pkl
+import torch
+import torch.nn.functional as F
+import torchvision
+import tvm
+import tvm.testing
+
+from matplotlib import pyplot as plt
+from torch import nn
+from torchvision import transforms
+from tvm import topi, relax, te
+from tvm.script import tir as T
+```
+
+#### 8.1 构建端到端的模型
+
+TVM提供了一个类``relax.BlockBuilder`能够从空白的IRMoudle开始一步步的构建端到端的模型，这里的“block”值得是就是Relax函数中的DataFlow Block。
+
+具体而言，在`BlockBuilder`中我们有一个`emit_te`的API，它可以**将一个张量表达式的算子描述转变成一个对应TensorIR函数的`call_tir`操作**，与手工写TensorIR函数相比减少了工作量。
+
+```
+# func是返回一个张量表达式函数，*input是func的输入
+emit_te(func, *input)
+```
+
+**示例**：以relu函数为例
+
+```python
+def relu(A):
+    B = te.compute(shape=(128, 128), fcompute=lambda i, j: te.max(A[i, j], 0), name="B")
+    return B
+
+def emit_te_example():
+    bb = relax.BlockBuilder()
+    shape = (128, 128)
+    dtype = "float32"
+    x_struct_info = relax.TensorStructInfo(shape, dtype)
+    x = relax.Var("x", x_struct_info)
+    with bb.function("main", [x]):
+        with bb.dataflow():
+            lv0 = bb.emit_te(relu, x)
+            gv = bb.emit_output(lv0)
+        bb.emit_func_output(gv)
+    return bb.get()
+```
+
+代码解释如下：
+
+1. `with bb.function(name, [*input])`API构建一个以x为输入的Relax函数`main`。
+2. 之后构建一个dataflow block
+   1. 首先使用`emit_te`生成一个调用ReLU算子的`call_tir`，这里的`emit_te`在IRModule中生成了一个名字为`relu`的TensorIR函数
+   2. 然后在dataflow block中生成`call_tir(relu, (x,), (128, 128), dtype="float32")`操作
+3. 在这一构造之后，BlockBuilder实例`bb`包含构建完的IRModule，它可以通过`bb.get()`得到。
+
+#### 8.2 端到端模型中的程序变换
+
+这次关注的算子是：conv2d（二维卷积）
+
+介绍两个新的原语：
+
+- `compute_inline`：将一个block内联到另一个block中，以减少内存使用大小和内存访问次数
+- `fuse`：和`split`相对。融合多个轴。这里的`fuse`与`parallel`/`vectorize`/`unroll`一起使用，以增加并行度。
+
+**示例1 compute_inline：**
+
+```python
+@T.prim_func
+def before_inline(a: T.handle, c: T.handle) -> None:
+    A = T.match_buffer(a, (128, 128))
+    B = T.alloc_buffer((128, 128))
+    C = T.match_buffer(c, (128, 128))
+    for i, j in T.grid(128, 128):
+        with T.block("B"):
+            vi, vj = T.axis.remap("SS", [i, j])
+            B[vi, vj] = A[vi, vj] * 2.0
+    for i, j in T.grid(128, 128):
+        with T.block("C"):
+            vi, vj = T.axis.remap("SS", [i, j])
+            C[vi, vj] = B[vi, vj] + 1.0
+
+
+sch = tvm.tir.Schedule(before_inline)
+IPython.display.Code(sch.mod["main"].script(), language="python")
+```
+
+得到的结果为：
+
+```python
+# from tvm.script import tir as T
+
+@T.prim_func
+def before_inline(A: T.Buffer((128, 128), "float32"), C: T.Buffer((128, 128), "float32")):
+    # with T.block("root"):
+    B = T.alloc_buffer((128, 128))
+    for i, j in T.grid(128, 128):
+        with T.block("B"):
+            vi, vj = T.axis.remap("SS", [i, j])
+            T.reads(A[vi, vj])
+            T.writes(B[vi, vj])
+            B[vi, vj] = A[vi, vj] * T.float32(2)
+    for i, j in T.grid(128, 128):
+        with T.block("C"):
+            vi, vj = T.axis.remap("SS", [i, j])
+            T.reads(B[vi, vj])
+            T.writes(C[vi, vj])
+            C[vi, vj] = B[vi, vj] + T.float32(1)
+```
+
+进行`compute_inline`变换后：
+
+```python
+sch.compute_inline(sch.get_block("B"))
+IPython.display.Code(sch.mod["main"].script(), language="python")
+```
+
+```python
+# from tvm.script import tir as T
+
+@T.prim_func
+def before_inline(A: T.Buffer((128, 128), "float32"), C: T.Buffer((128, 128), "float32")):
+    # with T.block("root"):
+    for i, j in T.grid(128, 128):
+        with T.block("C"):
+            vi, vj = T.axis.remap("SS", [i, j])
+            T.reads(A[vi, vj])
+            T.writes(C[vi, vj])
+            C[vi, vj] = A[vi, vj] * T.float32(2) + T.float32(1)
+```
+
+**示例2 fuse**：
+
+```python
+@T.prim_func
+def before_fuse(a: T.handle, b: T.handle) -> None:
+    A = T.match_buffer(a, (128, 128))
+    B = T.match_buffer(b, (128, 128))
+    for i, j in T.grid(128, 128):
+        with T.block("B"):
+            vi, vj = T.axis.remap("SS", [i, j])
+            B[vi, vj] = A[vi, vj] * 2.0
+
+
+sch = tvm.tir.Schedule(before_fuse)
+IPython.display.Code(sch.mod["main"].script(), language="python")
+```
+
+得到的结果为：
+
+```python
+# from tvm.script import tir as T
+
+@T.prim_func
+def before_fuse(A: T.Buffer((128, 128), "float32"), B: T.Buffer((128, 128), "float32")):
+    # with T.block("root"):
+    for i, j in T.grid(128, 128):
+        with T.block("B"):
+            vi, vj = T.axis.remap("SS", [i, j])
+            T.reads(A[vi, vj])
+            T.writes(B[vi, vj])
+            B[vi, vj] = A[vi, vj] * T.float32(2)
+```
+
+进行`fuse`后：
+
+```python
+i, j = sch.get_loops(sch.get_block("B"))
+sch.fuse(i, j)
+IPython.display.Code(sch.mod["main"].script(), language="python")
+```
+
+```python
+# from tvm.script import tir as T
+
+@T.prim_func
+def before_fuse(A: T.Buffer((128, 128), "float32"), B: T.Buffer((128, 128), "float32")):
+    # with T.block("root"):
+    for i_j_fused in range(16384):
+        with T.block("B"):
+            vi = T.axis.spatial(128, i_j_fused // 128)
+            vj = T.axis.spatial(128, i_j_fused % 128)
+            T.reads(A[vi, vj])
+            T.writes(B[vi, vj])
+            B[vi, vj] = A[vi, vj] * T.float32(2)
+```
+
